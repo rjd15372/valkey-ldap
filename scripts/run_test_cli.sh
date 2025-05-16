@@ -20,7 +20,7 @@ while true; do
     nc -z localhost 6379 && break
 done
 
-docker exec -ti valkey valkey-cli config set ldap.servers "ldap://ldap"
+docker exec -ti valkey valkey-cli config set ldap.servers "ldap://ldap ldap://ldap-2"
 docker exec -ti valkey valkey-cli config set ldap.bind_dn_suffix ",OU=devops,DC=valkey,DC=io"
 docker exec -ti valkey valkey-cli ACL SETUSER user1 ON \>pass allcommands
 docker exec -ti valkey valkey-cli ACL SETUSER u2 ON \>pass allcommands

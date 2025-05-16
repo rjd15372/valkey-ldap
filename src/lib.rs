@@ -4,7 +4,9 @@ mod version;
 mod vkldap;
 
 use auth::ldap_auth_blocking_callback;
+use log::debug;
 use version::module_version;
+use vkldap::{start_ldap_failure_detector, stop_ldap_failure_detector};
 
 use valkey_module::{
     Context, Status, ValkeyString, configuration::ConfigurationFlags,
@@ -16,6 +18,17 @@ fn initializer(_: &Context, _args: &[ValkeyString]) -> Status {
     if let Err(_) = res {
         return Status::Err;
     }
+
+    start_ldap_failure_detector();
+
+    Status::Ok
+}
+
+fn deinitializer(_: &Context) -> Status {
+    if let Err(err) = stop_ldap_failure_detector() {
+        debug!("{err}");
+        return Status::Err;
+    }
     Status::Ok
 }
 
@@ -25,6 +38,7 @@ valkey_module! {
     allocator: (valkey_module::alloc::ValkeyAlloc, valkey_module::alloc::ValkeyAlloc),
     data_types: [],
     init: initializer,
+    deinit: deinitializer,
     auth: [
         ldap_auth_blocking_callback
     ],

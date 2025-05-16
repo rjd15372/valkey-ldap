@@ -1,20 +1,53 @@
 use lazy_static::lazy_static;
 use ldap3::{LdapConn, LdapConnSettings, LdapError, Scope, SearchEntry};
+use log::{debug, info, warn};
 use native_tls::{Certificate, Identity, TlsConnector};
-use std::{collections::LinkedList, fs, sync::Mutex};
+use std::{
+    fs,
+    sync::Mutex,
+    thread::{self, JoinHandle},
+    time::Duration,
+};
 use url::Url;
 use valkey_module::ValkeyError;
 
 use crate::configs::LdapSearchScope;
 
+enum VkLdapServerStatus {
+    HEALTHY,
+    UNHEALTHY,
+}
+
+struct VkLdapServer {
+    url: Url,
+    id: usize,
+    status: VkLdapServerStatus,
+}
+
+fn check_server_health(server_url: &Url) -> Result<()> {
+    match LdapConn::from_url(&server_url) {
+        Ok(_) => Ok(()),
+        Err(err) => Err(VkLdapError::LdapConnectionError(err)),
+    }
+}
+
+struct VkLdapServerInfo {
+    url: Url,
+    id: usize,
+}
+
 struct VkLdapConfig {
-    servers: LinkedList<Url>,
+    servers: Vec<VkLdapServer>,
+    stop_failure_detector: bool,
+    detector_thread_handle: Option<thread::JoinHandle<()>>,
 }
 
 impl VkLdapConfig {
     fn new() -> VkLdapConfig {
         VkLdapConfig {
-            servers: LinkedList::new(),
+            servers: Vec::new(),
+            stop_failure_detector: false,
+            detector_thread_handle: None,
         }
     }
 
@@ -23,24 +56,98 @@ impl VkLdapConfig {
     }
 
     fn add_server(&mut self, server_url: Url) -> () {
-        self.servers.push_back(server_url);
+        let health_result = check_server_health(&server_url);
+        let url_str = server_url.to_string();
+        self.servers.push(VkLdapServer {
+            url: server_url,
+            id: self.servers.len(),
+            status: match health_result {
+                Ok(_) => VkLdapServerStatus::HEALTHY,
+                Err(err) => {
+                    let err_msg = err.to_string();
+                    warn!("server {url_str} is UNHEALTHY: {err_msg}");
+                    VkLdapServerStatus::UNHEALTHY
+                }
+            },
+        });
     }
 
-    pub fn find_server(&self) -> Option<&Url> {
-        self.servers.front()
+    fn check_servers_health(&mut self) {
+        for server in self.servers.iter_mut() {
+            match check_server_health(&server.url) {
+                Ok(_) => {
+                    if let VkLdapServerStatus::UNHEALTHY = server.status {
+                        let url = &server.url;
+                        info!("transition server {url} UNHEALTHY -> HEALTHY");
+                    }
+                    server.status = VkLdapServerStatus::HEALTHY
+                }
+                Err(err) => {
+                    if let VkLdapServerStatus::HEALTHY = server.status {
+                        let url = &server.url;
+                        let err_msg = err.to_string();
+                        info!("transition server {url} HEALTHY -> UNHEALTHY: {err_msg}");
+                    }
+                    server.status = VkLdapServerStatus::UNHEALTHY
+                }
+            }
+        }
+    }
+
+    fn find_server(&self) -> Result<VkLdapServerInfo> {
+        if self.servers.is_empty() {
+            return Err(VkLdapError::NoServerConfigured);
+        }
+
+        for server in self.servers.iter() {
+            if let VkLdapServerStatus::HEALTHY = server.status {
+                return Ok(VkLdapServerInfo {
+                    url: server.url.clone(),
+                    id: server.id,
+                });
+            }
+        }
+
+        Err(VkLdapError::NoHealthyServerAvailable)
+    }
+
+    fn failover_server(
+        &mut self,
+        failed_server: VkLdapServerInfo,
+        err: &VkLdapError,
+    ) -> Result<VkLdapServerInfo> {
+        if self.servers.is_empty() {
+            // The server list was cleared in the meantime, no new server can be returned.
+            return Err(VkLdapError::NoServerConfigured);
+        }
+        let next_server_index = (failed_server.id + 1) % self.servers.len();
+
+        if let VkLdapServerStatus::HEALTHY = self.servers[failed_server.id].status {
+            if self.servers[failed_server.id].url == failed_server.url {
+                // Mark the server unhealthy with the last error raised by the LDAP connection.
+                let url = &failed_server.url;
+                let err_msg = err.to_string();
+                info!("transition server {url} HEALTHY -> UNHEALTHY: {err_msg}");
+                self.servers[failed_server.id].status = VkLdapServerStatus::UNHEALTHY;
+            }
+        }
+
+        for idx in next_server_index..self.servers.len() {
+            let new_server = &self.servers[idx];
+            if let VkLdapServerStatus::HEALTHY = new_server.status {
+                return Ok(VkLdapServerInfo {
+                    url: new_server.url.clone(),
+                    id: new_server.id,
+                });
+            }
+        }
+
+        Err(VkLdapError::NoHealthyServerAvailable)
     }
 }
 
 lazy_static! {
     static ref LDAP_CONFIG: Mutex<VkLdapConfig> = Mutex::new(VkLdapConfig::new());
-}
-
-pub fn clear_server_list() -> () {
-    LDAP_CONFIG.lock().unwrap().clear_server_list();
-}
-
-pub fn add_server(server_url: Url) {
-    LDAP_CONFIG.lock().unwrap().add_server(server_url);
 }
 
 pub enum VkLdapError {
@@ -51,9 +158,12 @@ pub enum VkLdapError {
     LdapAdminBindError(LdapError),
     LdapSearchError(LdapError),
     LdapCreateContextError(LdapError),
+    LdapConnectionError(LdapError),
     NoLdapEntryFound(String),
     MultipleEntryFound(String),
     NoServerConfigured,
+    NoHealthyServerAvailable,
+    FailedToStopFailuredDetectorThread,
 }
 
 impl std::fmt::Display for VkLdapError {
@@ -77,6 +187,9 @@ impl std::fmt::Display for VkLdapError {
             VkLdapError::LdapCreateContextError(ldaperr) => {
                 write!(f, "failed to create LDAP connection context: {ldaperr}")
             }
+            VkLdapError::LdapConnectionError(ldaperr) => {
+                write!(f, "failed to establish an LDAP connection: {ldaperr}")
+            }
             VkLdapError::NoLdapEntryFound(filter) => {
                 write!(f, "search filter '{filter}' returned no entries")
             }
@@ -86,6 +199,14 @@ impl std::fmt::Display for VkLdapError {
             VkLdapError::NoServerConfigured => write!(
                 f,
                 "no server set in configuration. Please set ldap.servers config option"
+            ),
+            VkLdapError::NoHealthyServerAvailable => write!(
+                f,
+                "all servers set in configuration are unhealthy. Please check the logs for more information"
+            ),
+            VkLdapError::FailedToStopFailuredDetectorThread => write!(
+                f,
+                "failed to wait for the failure detector thread to finish"
             ),
         }
     }
@@ -195,11 +316,14 @@ struct VkLdapContext {
 }
 
 impl VkLdapContext {
-    fn new(settings: VkLdapSettings, url: &Url) -> Result<Self> {
+    fn create_ldap_connection(
+        settings: &VkLdapSettings,
+        server: &VkLdapServerInfo,
+    ) -> Result<LdapConn> {
         let mut ldap_conn_settings = LdapConnSettings::new();
 
         let use_starttls = settings.use_starttls;
-        let requires_tls = url.scheme() == "ldaps" || use_starttls;
+        let requires_tls = server.url.scheme() == "ldaps" || use_starttls;
 
         if requires_tls {
             let mut tls_builder = &mut TlsConnector::builder();
@@ -244,12 +368,50 @@ impl VkLdapContext {
             ldap_conn_settings = ldap_conn_settings.set_starttls(settings.use_starttls);
         }
 
-        match LdapConn::from_url_with_settings(ldap_conn_settings, url) {
-            Ok(ldap_conn) => Ok(VkLdapContext {
-                ldap_conn,
-                settings,
-            }),
+        match LdapConn::from_url_with_settings(ldap_conn_settings, &server.url) {
+            Ok(ldap_conn) => Ok(ldap_conn),
             Err(err) => Err(VkLdapError::LdapCreateContextError(err)),
+        }
+    }
+
+    fn new(settings: VkLdapSettings) -> Result<Self> {
+        let mut server: VkLdapServerInfo;
+        {
+            let config = LDAP_CONFIG.lock().unwrap();
+            server = config.find_server()?;
+        }
+
+        loop {
+            let url = &server.url;
+            debug!("creating LDAP connection to {url}");
+            match Self::create_ldap_connection(&settings, &server) {
+                Ok(ldap_conn) => {
+                    return Ok(VkLdapContext {
+                        ldap_conn,
+                        settings,
+                    });
+                }
+                Err(err) => match err {
+                    VkLdapError::LdapCreateContextError(_) => {
+                        let mut config = LDAP_CONFIG.lock().unwrap();
+                        let failover_server = config.failover_server(server, &err);
+
+                        match failover_server {
+                            Ok(new_server) => {
+                                let url = &new_server.url;
+                                warn!("failing over to server {url}");
+                                server = new_server;
+                            }
+                            Err(err) => {
+                                return Err(err);
+                            }
+                        };
+                    }
+                    _ => {
+                        return Err(err);
+                    }
+                },
+            }
         }
     }
 
@@ -325,17 +487,18 @@ impl Drop for VkLdapContext {
     }
 }
 
-fn get_ldap_context(settings: VkLdapSettings) -> Result<VkLdapContext> {
-    let config = LDAP_CONFIG.lock().unwrap();
-    let url_opt = config.find_server();
-    match url_opt {
-        Some(url) => VkLdapContext::new(settings, url),
-        None => Err(VkLdapError::NoServerConfigured),
-    }
+/// PUBLIC Interface
+
+pub fn clear_server_list() -> () {
+    LDAP_CONFIG.lock().unwrap().clear_server_list();
+}
+
+pub fn add_server(server_url: Url) {
+    LDAP_CONFIG.lock().unwrap().add_server(server_url);
 }
 
 pub fn vk_ldap_bind(settings: VkLdapSettings, username: &str, password: &str) -> Result<()> {
-    let mut ldap_ctx = get_ldap_context(settings)?;
+    let mut ldap_ctx = VkLdapContext::new(settings)?;
     let prefix = &ldap_ctx.settings.bind_db_prefix;
     let suffix = &ldap_ctx.settings.bind_db_suffix;
     let user_dn = format!("{prefix}{username}{suffix}");
@@ -347,7 +510,39 @@ pub fn vk_ldap_search_and_bind(
     username: &str,
     password: &str,
 ) -> Result<()> {
-    let mut ldap_ctx = get_ldap_context(settings)?;
+    let mut ldap_ctx = VkLdapContext::new(settings)?;
     let user_dn = ldap_ctx.search(username)?;
     ldap_ctx.bind(user_dn.as_str(), password)
+}
+
+pub fn stop_ldap_failure_detector() -> Result<()> {
+    let handler_opt: Option<JoinHandle<()>>;
+    {
+        let mut config = LDAP_CONFIG.lock().unwrap();
+        config.stop_failure_detector = true;
+        handler_opt = config.detector_thread_handle.take();
+    }
+
+    if let Some(handler) = handler_opt {
+        match handler.join() {
+            Ok(_) => Ok(()),
+            Err(_) => Err(VkLdapError::FailedToStopFailuredDetectorThread),
+        }
+    } else {
+        panic!("failure detector thread should have been initialized");
+    }
+}
+
+pub fn start_ldap_failure_detector() -> () {
+    let mut config = LDAP_CONFIG.lock().unwrap();
+    config.detector_thread_handle = Some(thread::spawn(|| {
+        loop {
+            thread::sleep(Duration::from_secs(1));
+            LDAP_CONFIG.lock().unwrap().check_servers_health();
+
+            if LDAP_CONFIG.lock().unwrap().stop_failure_detector {
+                return ();
+            }
+        }
+    }));
 }
