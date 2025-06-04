@@ -65,7 +65,7 @@ jobs:
       - name: Extract changelog for this version
         id: changelog
         run: |
-          CHANGELOG=$(./script/extract_changelog.sh "${{ steps.extract_version.outputs.VERSION }}")
+          CHANGELOG=$(./scripts/extract_changelog.sh "${{ steps.extract_version.outputs.VERSION }}")
           # Escape newlines for GitHub Actions output
           CHANGELOG="${CHANGELOG//'%'/'%25'}"
           CHANGELOG="${CHANGELOG//$'\n'/'%0A'}"
