@@ -3,7 +3,7 @@ name: Release Packaging
 on:
   push:
     tags:
-        -'v*'
+        - 'v*'
 
 jobs:
   Create_RPM_Package:
