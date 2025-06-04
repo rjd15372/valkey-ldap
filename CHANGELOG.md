@@ -9,4 +9,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+## [0.0.1]
+
+### Added
+
 - Initial version of an LDAP authentication module for Valkey 8.X or above
