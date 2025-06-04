@@ -55,12 +55,27 @@ jobs:
       - name: Build
         run: cargo build --release
 
-      - name: Package source
-        run: tar czf valkey-ldap-source.tar.gz src Cargo.toml Cargo.lock README.md LICENSE build.rs
+      - name: Extract version from tag
+        id: extract_version
+        run: |
+          VERSION="${GITHUB_REF##*/}"
+          VERSION="${VERSION#v}"
+          echo "VERSION=$VERSION" >> $GITHUB_OUTPUT
+
+      - name: Extract changelog for this version
+        id: changelog
+        run: |
+          CHANGELOG=$(./script/extract_changelog.sh "${{ steps.extract_version.outputs.VERSION }}")
+          # Escape newlines for GitHub Actions output
+          CHANGELOG="${CHANGELOG//'%'/'%25'}"
+          CHANGELOG="${CHANGELOG//$'\n'/'%0A'}"
+          CHANGELOG="${CHANGELOG//$'\r'/'%0D'}"
+          echo "log=$CHANGELOG" >> $GITHUB_OUTPUT
 
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
         with:
-          files: valkey-ldap-source.tar.gz
+          name: ${{ steps.extract_version.outputs.VERSION }}
+          body: ${{ steps.changelog.outputs.log }}
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
