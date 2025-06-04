@@ -13,7 +13,7 @@ jobs:
       image: fedora:41
     steps:
         - name: Checkout code
-          uses: actions/checkout@b4ffde65f46336ab88eb53be808477a3936bae11 # v4.1.1
+          uses: actions/checkout@v4
 
         - name: Install dependencies
           shell: bash
@@ -42,4 +42,25 @@ jobs:
         - name: Trigger Copr Build
           run : |
             SRPM=`ls valkey-ldap*.rpm`
-            copr-cli --config copr.config build valkey-ldap $SRPM
+            copr-cli --config copr.config build testing-github-release-action $SRPM
+
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Build
+        run: cargo build --release
+
+      - name: Package source
+        run: tar czf valkey-ldap-source.tar.gz src Cargo.toml Cargo.lock README.md LICENSE build.rs
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: valkey-ldap-source.tar.gz
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
