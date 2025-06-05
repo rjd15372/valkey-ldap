@@ -66,7 +66,9 @@ jobs:
         id: changelog
         run: |
           CHANGELOG=$(./scripts/extract_changelog.sh "${{ steps.extract_version.outputs.VERSION }}")
-          echo "log=$CHANGELOG" >> $GITHUB_OUTPUT
+          echo "log<<EOF" >> $GITHUB_OUTPUT
+          echo "$CHANGELOG" >> $GITHUB_OUTPUT
+          echo "EOF" >> $GITHUB_OUTPUT
 
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
