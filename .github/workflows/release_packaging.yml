@@ -66,10 +66,6 @@ jobs:
         id: changelog
         run: |
           CHANGELOG=$(./scripts/extract_changelog.sh "${{ steps.extract_version.outputs.VERSION }}")
-          # Escape newlines for GitHub Actions output
-          CHANGELOG="${CHANGELOG//'%'/'%25'}"
-          CHANGELOG="${CHANGELOG//$'\n'/'%0A'}"
-          CHANGELOG="${CHANGELOG//$'\r'/'%0D'}"
           echo "log=$CHANGELOG" >> $GITHUB_OUTPUT
 
       - name: Create GitHub Release
