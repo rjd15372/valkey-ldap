@@ -75,5 +75,6 @@ jobs:
         with:
           name: ${{ steps.extract_version.outputs.VERSION }}
           body: ${{ steps.changelog.outputs.log }}
+          draft: true
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
